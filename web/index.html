@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <!--
+    If you are serving your web app in a path other than the root, change the
+    href value below to reflect the base path you are serving from.
+
+    The path provided below has to start and end with a slash "/" in order for
+    it to work correctly.
+
+    For more details:
+    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
+
+    This is a placeholder for base href that will be replaced by the value of
+    the `--base-href` argument provided to `flutter build`.
+  -->
+  <base href="$FLUTTER_BASE_HREF">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="A new Flutter project.">
+
+  <!-- iOS meta tags & icons -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="examiq_app">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="favicon.png"/>
+
+  <title>examiq_app</title>
+  <link rel="manifest" href="manifest.json">
+  <style>
+    html, body {
+      -webkit-user-select: none;
+      -moz-user-select: none;
+      -ms-user-select: none;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <script>
+    (function () {
+      // Hard lock mode: active by default on web page load.
+      let examModeActive = true;
+      let listenersInstalled = false;
+      const disposers = [];
+
+      const add = (target, type, handler, opts = true) => {
+        if (!target || !target.addEventListener) return;
+        target.addEventListener(type, handler, opts);
+        disposers.push(() => target.removeEventListener(type, handler, opts));
+      };
+
+      const clearAll = () => {
+        while (disposers.length) {
+          try { disposers.pop()(); } catch (_) {}
+        }
+      };
+
+      const emit = (type, detail) => {
+        try {
+          const payload = JSON.stringify({
+            source: 'examiq_guard',
+            type,
+            detail: detail || '',
+            ts: Date.now()
+          });
+          window.postMessage(
+            payload,
+            '*'
+          );
+          window.postMessage(
+            JSON.stringify({ source: 'examiq_anti_cheat', type, detail: detail || '', ts: Date.now() }),
+            '*'
+          );
+        } catch (_) {}
+      };
+
+      const block = (event, tag) => {
+        if (!examModeActive) return;
+        event.preventDefault();
+        if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+        event.stopPropagation();
+        emit('clipboard_blocked', tag);
+      };
+
+      const installListeners = () => {
+        if (listenersInstalled) return;
+        listenersInstalled = true;
+        const capture = true;
+        const targets = [window, document, document.documentElement, document.body].filter(Boolean);
+
+        for (const target of targets) {
+          add(target, 'copy', (e) => block(e, 'copy'), capture);
+          add(target, 'cut', (e) => block(e, 'cut'), capture);
+          add(target, 'paste', (e) => block(e, 'paste'), capture);
+          add(target, 'beforecopy', (e) => block(e, 'beforecopy'), capture);
+          add(target, 'beforecut', (e) => block(e, 'beforecut'), capture);
+          add(target, 'beforepaste', (e) => block(e, 'beforepaste'), capture);
+          add(target, 'contextmenu', (e) => block(e, 'contextmenu'), capture);
+          add(target, 'dragstart', (e) => block(e, 'dragstart'), capture);
+          add(target, 'drop', (e) => block(e, 'drop'), capture);
+          add(target, 'selectstart', (e) => block(e, 'selectstart'), capture);
+          add(target, 'beforeinput', (e) => {
+            const inputType = String(e && e.inputType ? e.inputType : '').toLowerCase();
+            if (
+              inputType.includes('paste') ||
+              inputType.includes('drop') ||
+              inputType.includes('insertfromyank')
+            ) {
+              block(e, `beforeinput_${inputType || 'blocked'}`);
+            }
+          }, capture);
+        }
+
+        add(window, 'keydown', (e) => {
+          if (!examModeActive) return;
+          const k = (e.key || '').toLowerCase();
+          const mod = e.ctrlKey || e.metaKey;
+          const blockedCombo = mod && (k === 'c' || k === 'v' || k === 'x' || k === 'a');
+          const shiftInsert = e.shiftKey && k === 'insert';
+          if (blockedCombo || shiftInsert) {
+            block(e, 'key_combo');
+          }
+        }, capture);
+
+        add(document, 'visibilitychange', () => {
+          if (!examModeActive) return;
+          if (document.hidden) {
+            emit('tab_switched', 'visibility_hidden');
+          } else {
+            emit('tab_returned', 'visibility_visible');
+          }
+        }, capture);
+        add(window, 'blur', () => {
+          if (!examModeActive) return;
+          emit('tab_switched', 'window_blur');
+        }, capture);
+        add(window, 'focus', () => {
+          if (!examModeActive) return;
+          emit('tab_returned', 'window_focus');
+        }, capture);
+      };
+
+      // Intercept screen capture: block during exam and emit event.
+      if (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {
+        const _origGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+        navigator.mediaDevices.getDisplayMedia = function (constraints) {
+          emit('screen_share_attempted', 'getDisplayMedia');
+          if (examModeActive) {
+            return Promise.reject(new DOMException('Screen capture is disabled during the exam.', 'NotAllowedError'));
+          }
+          return _origGetDisplayMedia(constraints);
+        };
+      }
+
+      window.startExamMode = function () {
+        examModeActive = true;
+        installListeners();
+      };
+
+      window.stopExamMode = function () {
+        examModeActive = false;
+      };
+
+      installListeners();
+    })();
+  </script>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>
