@@ -96,6 +96,13 @@ Future<void> _handleRequest(HttpRequest request) async {
       return;
     }
 
+    if (request.method == 'POST' && path == '/api/class-summary') {
+      final body = await _readJson(request);
+      final result = await _classSummary(body);
+      await _writeJson(request.response, result);
+      return;
+    }
+
     if (request.method == 'POST' && path == '/api/generate-report') {
       final body = await _readJson(request);
       await _writeJson(request.response, {
@@ -737,6 +744,55 @@ Future<Map<String, dynamic>> _detectPlagiarism(Map<String, dynamic> body) async 
       'risk_level: "high" (>0.85 or direct copy), "medium" (0.65-0.85), "low" (notable coincidence).\n'
       'Only flag genuinely suspicious pairs. Empty flagged_pairs if no plagiarism found.\n\n'
       'Data:\n${jsonEncode(analysisData)}';
+
+  final text = await _callClaude(prompt, system, maxTokens: 1024);
+  if (text == null) return {'success': false, 'error': 'AI service unavailable'};
+
+  try {
+    final match = RegExp(r'\{[\s\S]*\}').firstMatch(text);
+    if (match == null) return {'success': false, 'error': 'No JSON in AI response'};
+    final result = jsonDecode(match.group(0)!) as Map<String, dynamic>;
+    return {'success': true, ...result};
+  } catch (_) {
+    return {'success': false, 'error': 'Failed to parse AI response'};
+  }
+}
+
+Future<Map<String, dynamic>> _classSummary(Map<String, dynamic> body) async {
+  final examTitle   = '${body['exam_title'] ?? 'Exam'}';
+  final studentCount = (body['student_count'] as num?)?.toInt() ?? 0;
+  final classAvg    = (body['class_avg']  as num?)?.toDouble() ?? 0.0;
+  final passRate    = (body['pass_rate']  as num?)?.toDouble() ?? 0.0;
+  final questionStats = body['question_stats'] as List? ?? [];
+
+  const system =
+      'You are an experienced educator analyzing class exam results. '
+      'Return ONLY valid JSON — no markdown fences, no extra text.';
+
+  final prompt =
+      'Analyze this class exam performance and return actionable insights for the teacher.\n\n'
+      'Return ONLY this exact JSON:\n'
+      '{\n'
+      '  "summary": "2-3 sentence plain-English overview of how the class performed",\n'
+      '  "hardest_questions": [\n'
+      '    {"q_index": 0, "question": "...", "wrong_pct": 75, "insight": "likely reason students struggled"}\n'
+      '  ],\n'
+      '  "most_missed_concepts": ["concept 1", "concept 2", "concept 3"],\n'
+      '  "class_strengths": ["strength 1", "strength 2"],\n'
+      '  "reteach_topics": [\n'
+      '    {"topic": "...", "priority": "high", "suggestion": "brief reteaching tip"}\n'
+      '  ],\n'
+      '  "encouragement": "One warm, honest sentence for the teacher"\n'
+      '}\n\n'
+      'priority must be "high" or "medium". '
+      'hardest_questions: include only questions with wrong_pct > 40%. '
+      'Keep all lists to max 4 items. '
+      'Be specific — name actual concepts from the questions, not generic advice.\n\n'
+      'Exam: "$examTitle"\n'
+      'Students: $studentCount\n'
+      'Class average: ${classAvg.toStringAsFixed(1)}%\n'
+      'Pass rate (≥50%): ${passRate.toStringAsFixed(1)}%\n'
+      'Per-question breakdown:\n${jsonEncode(questionStats)}';
 
   final text = await _callClaude(prompt, system, maxTokens: 1024);
   if (text == null) return {'success': false, 'error': 'AI service unavailable'};

@@ -394,6 +394,528 @@ class _TeacherDashboardState extends State<TeacherDashboard>
     );
   }
 
+  // ── AI Class Summary ───────────────────────────────────────────────────────
+  Future<void> _getClassSummary(Map<String, dynamic> exam) async {
+    final examId = exam['id'] as String;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(
+          children: [
+            CircularProgressIndicator(color: Color(0xFF534AB7)),
+            SizedBox(width: 16),
+            Expanded(child: Text('Generating class summary...')),
+          ],
+        ),
+      ),
+    );
+
+    try {
+      final examDoc = await _db.collection('exams').doc(examId).get();
+      final questions = List<Map<String, dynamic>>.from(
+        ((examDoc.data()?['questions'] as List?) ?? [])
+            .map((q) => Map<String, dynamic>.from(q as Map)),
+      );
+
+      final scoresSnap = await _db
+          .collection('exam_scores')
+          .where('exam_id', isEqualTo: examId)
+          .get();
+
+      if (!mounted) return;
+
+      if (scoresSnap.docs.isEmpty) {
+        Navigator.pop(context);
+        _showError('No graded scores yet. Generate the report first.');
+        return;
+      }
+
+      final studentScores =
+          scoresSnap.docs.map((d) => d.data()).toList();
+
+      // Per-question accuracy stats computed client-side
+      final questionStats = <Map<String, dynamic>>[];
+      for (var i = 0; i < questions.length; i++) {
+        final q = questions[i];
+        final marks = ((q['marks'] as num?) ?? 1).toInt();
+        int answered = 0;
+        int fullMarks = 0;
+        int zeroMarks = 0;
+        double totalEarned = 0;
+
+        for (final s in studentScores) {
+          final qList = (s['question_scores'] as List? ?? [])
+              .cast<Map<String, dynamic>>();
+          final qs = qList.cast<Map<String, dynamic>?>().firstWhere(
+                (e) => e != null && (e['q_index'] as num?)?.toInt() == i,
+                orElse: () => null,
+              );
+          if (qs != null) {
+            answered++;
+            final earned = ((qs['earned'] as num?) ?? 0).toInt();
+            totalEarned += earned;
+            if (earned == marks) fullMarks++;
+            if (earned == 0) zeroMarks++;
+          }
+        }
+
+        final avgPct =
+            answered > 0 ? totalEarned / answered / marks * 100 : 0.0;
+        final wrongPct =
+            answered > 0 ? (answered - fullMarks) / answered * 100 : 0.0;
+
+        questionStats.add({
+          'q_index':        i,
+          'question':       q['q'] ?? q['question'] ?? '',
+          'type':           q['type'] ?? 'mcq',
+          'marks':          marks,
+          'answered_by':    answered,
+          'full_marks_pct': double.parse(
+              (answered > 0 ? fullMarks / answered * 100 : 0.0)
+                  .toStringAsFixed(1)),
+          'zero_marks_pct': double.parse(
+              (answered > 0 ? zeroMarks / answered * 100 : 0.0)
+                  .toStringAsFixed(1)),
+          'avg_score_pct':  double.parse(avgPct.toStringAsFixed(1)),
+          'wrong_pct':      double.parse(wrongPct.toStringAsFixed(1)),
+        });
+      }
+
+      final percentages = studentScores
+          .map((s) => ((s['percentage'] as num?) ?? 0.0).toDouble())
+          .toList();
+      final classAvg = percentages.isEmpty
+          ? 0.0
+          : percentages.reduce((a, b) => a + b) / percentages.length;
+      final passRate = percentages.isEmpty
+          ? 0.0
+          : percentages.where((p) => p >= 50).length /
+              percentages.length *
+              100;
+
+      final result = await ApiService.getClassSummary(
+        examId:       examId,
+        examTitle:    exam['title'] ?? '',
+        studentCount: studentScores.length,
+        classAvg:     classAvg,
+        passRate:     passRate,
+        questionStats: questionStats,
+      );
+
+      if (!mounted) return;
+      Navigator.pop(context);
+
+      if (result['success'] != true) {
+        _showError(result['error'] ?? 'Class summary failed');
+        return;
+      }
+
+      _showClassSummarySheet(
+        title:       exam['title'] ?? '',
+        classAvg:    classAvg,
+        passRate:    passRate,
+        studentCount: studentScores.length,
+        result:      result,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.pop(context);
+      _showError('Error: $e');
+    }
+  }
+
+  void _showClassSummarySheet({
+    required String title,
+    required double classAvg,
+    required double passRate,
+    required int studentCount,
+    required Map<String, dynamic> result,
+  }) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.82,
+        minChildSize: 0.5,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (_, sc) => _buildClassSummarySheet(
+          sc, title, classAvg, passRate, studentCount, result),
+      ),
+    );
+  }
+
+  Widget _buildClassSummarySheet(
+    ScrollController sc,
+    String title,
+    double classAvg,
+    double passRate,
+    int studentCount,
+    Map<String, dynamic> result,
+  ) {
+    final summary     = result['summary'] as String? ?? '';
+    final hardest     = List<Map<String, dynamic>>.from(
+        (result['hardest_questions'] as List? ?? [])
+            .map((e) => Map<String, dynamic>.from(e as Map)));
+    final missed      = List<String>.from(result['most_missed_concepts'] as List? ?? []);
+    final strengths   = List<String>.from(result['class_strengths'] as List? ?? []);
+    final reteach     = List<Map<String, dynamic>>.from(
+        (result['reteach_topics'] as List? ?? [])
+            .map((e) => Map<String, dynamic>.from(e as Map)));
+    final encourage   = result['encouragement'] as String? ?? '';
+
+    return Column(
+      children: [
+        Container(
+          margin: const EdgeInsets.only(top: 10),
+          width: 40, height: 4,
+          decoration: BoxDecoration(
+              color: Colors.grey[300],
+              borderRadius: BorderRadius.circular(2)),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+          child: Row(
+            children: [
+              const Icon(Icons.auto_awesome_rounded,
+                  color: Color(0xFF534AB7), size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'AI Class Summary · $title',
+                  style: const TextStyle(
+                      fontSize: 15, fontWeight: FontWeight.bold),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: ListView(
+            controller: sc,
+            padding: const EdgeInsets.all(16),
+            children: [
+              // Stat row
+              Row(
+                children: [
+                  _classStat('${classAvg.toStringAsFixed(1)}%', 'Class Avg',
+                      const Color(0xFF534AB7)),
+                  const SizedBox(width: 10),
+                  _classStat('${passRate.toStringAsFixed(0)}%', 'Pass Rate',
+                      passRate >= 70
+                          ? const Color(0xFF1D9E75)
+                          : const Color(0xFFBA7517)),
+                  const SizedBox(width: 10),
+                  _classStat('$studentCount', 'Students',
+                      const Color(0xFF444441)),
+                ],
+              ),
+              const SizedBox(height: 14),
+
+              // AI summary paragraph
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFF534AB7), Color(0xFF7B74E0)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  summary,
+                  style: const TextStyle(
+                      color: Colors.white, fontSize: 13, height: 1.5),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Hardest questions
+              if (hardest.isNotEmpty) ...[
+                _sectionHeader(Icons.trending_down_rounded,
+                    'Hardest Questions', const Color(0xFFA32D2D)),
+                const SizedBox(height: 8),
+                ...hardest.map((q) => _hardestQCard(q)),
+                const SizedBox(height: 14),
+              ],
+
+              // Most missed concepts + strengths in a row
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (missed.isNotEmpty)
+                    Expanded(
+                      child: _chipSection(
+                        icon: Icons.warning_amber_rounded,
+                        label: 'Missed Concepts',
+                        color: const Color(0xFFBA7517),
+                        bgColor: const Color(0xFFFAEEDA),
+                        items: missed,
+                      ),
+                    ),
+                  if (missed.isNotEmpty && strengths.isNotEmpty)
+                    const SizedBox(width: 10),
+                  if (strengths.isNotEmpty)
+                    Expanded(
+                      child: _chipSection(
+                        icon: Icons.thumb_up_alt_rounded,
+                        label: 'Strengths',
+                        color: const Color(0xFF1D9E75),
+                        bgColor: const Color(0xFFE1F5EE),
+                        items: strengths,
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 14),
+
+              // Re-teach recommendations
+              if (reteach.isNotEmpty) ...[
+                _sectionHeader(Icons.school_rounded,
+                    'Re-Teaching Priorities', const Color(0xFF534AB7)),
+                const SizedBox(height: 8),
+                ...reteach.map((t) => _reteachCard(t)),
+                const SizedBox(height: 14),
+              ],
+
+              // Encouragement
+              if (encourage.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFEEEDFE),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.favorite_rounded,
+                          color: Color(0xFF534AB7), size: 16),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          encourage,
+                          style: const TextStyle(
+                              fontSize: 12,
+                              color: Color(0xFF534AB7),
+                              fontStyle: FontStyle.italic),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _classStat(String value, String label, Color color) => Expanded(
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.08),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Column(
+            children: [
+              Text(value,
+                  style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: color)),
+              const SizedBox(height: 2),
+              Text(label,
+                  style: TextStyle(fontSize: 11, color: color.withOpacity(0.8))),
+            ],
+          ),
+        ),
+      );
+
+  Widget _sectionHeader(IconData icon, String label, Color color) => Row(
+        children: [
+          Icon(icon, color: color, size: 16),
+          const SizedBox(width: 6),
+          Text(label,
+              style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  color: color)),
+        ],
+      );
+
+  Widget _hardestQCard(Map<String, dynamic> q) {
+    final wrongPct = ((q['wrong_pct'] as num?) ?? 0).toInt();
+    final question = q['question'] as String? ?? '';
+    final insight  = q['insight']  as String? ?? '';
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFCEBEB),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFA32D2D).withOpacity(0.2)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFA32D2D),
+                  borderRadius: BorderRadius.circular(5),
+                ),
+                child: Text(
+                  '$wrongPct% wrong',
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(question,
+              style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xFF1a1a2e))),
+          if (insight.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(insight,
+                style: const TextStyle(
+                    fontSize: 11, color: Color(0xFFA32D2D))),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _chipSection({
+    required IconData icon,
+    required String label,
+    required Color color,
+    required Color bgColor,
+    required List<String> items,
+  }) =>
+      Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: bgColor,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(icon, color: color, size: 13),
+                const SizedBox(width: 4),
+                Text(label,
+                    style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                        color: color)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            ...items.map((item) => Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('• ',
+                          style: TextStyle(
+                              color: color, fontWeight: FontWeight.bold)),
+                      Expanded(
+                        child: Text(item,
+                            style: TextStyle(
+                                fontSize: 11, color: color.withOpacity(0.9))),
+                      ),
+                    ],
+                  ),
+                )),
+          ],
+        ),
+      );
+
+  Widget _reteachCard(Map<String, dynamic> t) {
+    final topic      = t['topic']      as String? ?? '';
+    final priority   = t['priority']   as String? ?? 'medium';
+    final suggestion = t['suggestion'] as String? ?? '';
+    final isHigh     = priority == 'high';
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+            color: const Color(0xFF534AB7).withOpacity(0.2)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            margin: const EdgeInsets.only(top: 2),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: isHigh
+                  ? const Color(0xFF534AB7)
+                  : const Color(0xFFEEEDFE),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              priority.toUpperCase(),
+              style: TextStyle(
+                  color: isHigh
+                      ? Colors.white
+                      : const Color(0xFF534AB7),
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(topic,
+                    style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF1a1a2e))),
+                if (suggestion.isNotEmpty) ...[
+                  const SizedBox(height: 3),
+                  Text(suggestion,
+                      style: const TextStyle(
+                          fontSize: 11, color: Colors.grey)),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ── Plagiarism detection ────────────────────────────────────────────────────
   Future<void> _checkPlagiarism(Map<String, dynamic> exam) async {
     final examId = exam['id'] as String;
@@ -1340,21 +1862,40 @@ class _TeacherDashboardState extends State<TeacherDashboard>
               ],
             ),
             const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () => _checkPlagiarism(exam),
-                icon: const Icon(Icons.content_copy_rounded, size: 16),
-                label: const Text('Check Plagiarism'),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: const Color(0xFFBA7517),
-                  side: const BorderSide(color: Color(0xFFBA7517)),
-                  minimumSize: const Size(0, 38),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => _checkPlagiarism(exam),
+                    icon: const Icon(Icons.content_copy_rounded, size: 15),
+                    label: const Text('Plagiarism'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFFBA7517),
+                      side: const BorderSide(color: Color(0xFFBA7517)),
+                      minimumSize: const Size(0, 38),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
                   ),
                 ),
-              ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => _getClassSummary(exam),
+                    icon: const Icon(Icons.auto_awesome_rounded, size: 15),
+                    label: const Text('AI Summary'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF534AB7),
+                      side: const BorderSide(color: Color(0xFF534AB7)),
+                      minimumSize: const Size(0, 38),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ],
         ),

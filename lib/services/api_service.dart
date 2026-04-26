@@ -313,6 +313,34 @@ class ApiService {
     }
   }
 
+  // ── AI: class performance summary for teacher ─────────────────────────────
+  static Future<Map<String, dynamic>> getClassSummary({
+    required String examId,
+    required String examTitle,
+    required int studentCount,
+    required double classAvg,
+    required double passRate,
+    required List<Map<String, dynamic>> questionStats,
+  }) async {
+    try {
+      final res = await _postWithFallback(
+        '/api/class-summary',
+        {
+          'exam_id':       examId,
+          'exam_title':    examTitle,
+          'student_count': studentCount,
+          'class_avg':     classAvg,
+          'pass_rate':     passRate,
+          'question_stats': questionStats,
+        },
+        timeout: const Duration(seconds: 60),
+      );
+      return jsonDecode(res.body) as Map<String, dynamic>;
+    } catch (e) {
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
   // ── AI: detect plagiarism across student answers ──────────────────────────
   static Future<Map<String, dynamic>> detectPlagiarism({
     required String examId,
