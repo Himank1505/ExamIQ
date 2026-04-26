@@ -4,6 +4,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import '../services/auth_service.dart';
 import 'exam_screen.dart';
 import 'enrollment_screen.dart';
+import 'student_analytics_screen.dart';
 
 class StudentDashboard extends StatefulWidget {
   const StudentDashboard({super.key});
@@ -111,6 +112,18 @@ class _StudentDashboardState extends State<StudentDashboard> {
     if (mounted) Navigator.pushReplacementNamed(context, '/login');
   }
 
+  void _openAnalytics() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => StudentAnalyticsScreen(
+          studentId:      _studentData?['id'] ?? '',
+          completedExams: _completedExams,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -119,6 +132,12 @@ class _StudentDashboardState extends State<StudentDashboard> {
         title: const Text('ExamIQ'),
         automaticallyImplyLeading: false,
         actions: [
+          if (_completedExams.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.insights_rounded),
+              tooltip: 'My Performance',
+              onPressed: _openAnalytics,
+            ),
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: _loadData,
@@ -150,7 +169,22 @@ class _StudentDashboardState extends State<StudentDashboard> {
               const SizedBox(height: 12),
               _buildUpcomingExams(),
               const SizedBox(height: 24),
-              _buildSectionTitle('Completed Exams'),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  _buildSectionTitle('Completed Exams'),
+                  if (_completedExams.isNotEmpty)
+                    TextButton.icon(
+                      onPressed: _openAnalytics,
+                      icon: const Icon(Icons.insights_rounded, size: 14),
+                      label: const Text('Analytics', style: TextStyle(fontSize: 12)),
+                      style: TextButton.styleFrom(
+                        foregroundColor: const Color(0xFF534AB7),
+                        padding: EdgeInsets.zero,
+                      ),
+                    ),
+                ],
+              ),
               const SizedBox(height: 12),
               _buildCompletedExams(),
               const SizedBox(height: 40),

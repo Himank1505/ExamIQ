@@ -82,6 +82,20 @@ Future<void> _handleRequest(HttpRequest request) async {
       return;
     }
 
+    if (request.method == 'POST' && path == '/api/student-insights') {
+      final body = await _readJson(request);
+      final result = await _studentInsights(body);
+      await _writeJson(request.response, result);
+      return;
+    }
+
+    if (request.method == 'POST' && path == '/api/detect-plagiarism') {
+      final body = await _readJson(request);
+      final result = await _detectPlagiarism(body);
+      await _writeJson(request.response, result);
+      return;
+    }
+
     if (request.method == 'POST' && path == '/api/generate-report') {
       final body = await _readJson(request);
       await _writeJson(request.response, {
@@ -617,6 +631,123 @@ Future<String?> _callClaude(
     return (data['content'] as List).first['text'] as String?;
   } finally {
     client.close();
+  }
+}
+
+Future<Map<String, dynamic>> _studentInsights(Map<String, dynamic> body) async {
+  const system =
+      'You are an academic performance coach. '
+      'Analyze the student exam data and return ONLY valid JSON — no markdown, no extra text.';
+
+  final prompt =
+      'Analyze this student\'s exam history and return a JSON object with these exact keys:\n'
+      '{"summary":"2-3 sentence overall assessment","strengths":["..."],'
+      '"areas_to_improve":["..."],"recommendations":["actionable tip 1","actionable tip 2","actionable tip 3"],'
+      '"integrity_note":"brief note if flags > 0, otherwise null"}\n\n'
+      'Student data:\n${jsonEncode(body)}';
+
+  final text = await _callClaude(prompt, system, maxTokens: 512);
+  if (text == null) {
+    return {'success': false, 'error': 'AI service unavailable — check CLAUDE_API_KEY'};
+  }
+
+  try {
+    final match = RegExp(r'\{[\s\S]*\}').firstMatch(text);
+    if (match == null) return {'success': false, 'error': 'No JSON in AI response'};
+    final insights = jsonDecode(match.group(0)!) as Map<String, dynamic>;
+    return {'success': true, ...insights};
+  } catch (_) {
+    return {'success': false, 'error': 'Failed to parse AI response'};
+  }
+}
+
+Future<Map<String, dynamic>> _detectPlagiarism(Map<String, dynamic> body) async {
+  final questionsRaw = body['questions'] as List? ?? [];
+  final studentAnswersRaw = body['student_answers'] as List? ?? [];
+
+  final questions = questionsRaw.cast<Map<String, dynamic>>();
+  final studentAnswers = studentAnswersRaw.cast<Map<String, dynamic>>();
+
+  if (studentAnswers.length < 2) {
+    return {
+      'success': true,
+      'flagged_pairs': [],
+      'summary': 'Need at least 2 student submissions to check for plagiarism.',
+    };
+  }
+
+  // Collect text question answers grouped by question index
+  final analysisData = <Map<String, dynamic>>[];
+  for (var i = 0; i < questions.length; i++) {
+    final q = questions[i];
+    if ((q['type'] ?? '') != 'text') continue;
+
+    final perStudent = <Map<String, dynamic>>[];
+    for (final sa in studentAnswers) {
+      final studentId = '${sa['student_id'] ?? ''}';
+      final answers = (sa['answers'] as Map?)?.cast<String, dynamic>() ?? {};
+      final ans = (answers['$i'] ?? '').toString().trim();
+      if (ans.isNotEmpty) {
+        perStudent.add({'student_id': studentId, 'answer': ans});
+      }
+    }
+    if (perStudent.length >= 2) {
+      analysisData.add({
+        'question_index': i,
+        'question': q['q'] ?? q['question'] ?? '',
+        'student_answers': perStudent,
+      });
+    }
+  }
+
+  if (analysisData.isEmpty) {
+    return {
+      'success': true,
+      'flagged_pairs': [],
+      'summary': 'No text questions with multiple student responses to compare.',
+    };
+  }
+
+  const system =
+      'You are an academic integrity expert. Detect plagiarism and collusion '
+      'in student exam answers. Return ONLY valid JSON — no markdown, no extra text.';
+
+  final prompt =
+      'Analyze these student exam answers for plagiarism or collusion. '
+      'Compare all pairs of students for each question.\n\n'
+      'Flag pairs where answers are suspiciously similar: same phrasing, copied sentences, '
+      'or unusual agreement beyond what independent correct answers would show.\n\n'
+      'Return ONLY this exact JSON:\n'
+      '{\n'
+      '  "flagged_pairs": [\n'
+      '    {\n'
+      '      "question_index": 0,\n'
+      '      "question": "...",\n'
+      '      "student_a": "student_id",\n'
+      '      "student_b": "student_id",\n'
+      '      "answer_a": "...",\n'
+      '      "answer_b": "...",\n'
+      '      "similarity_score": 0.85,\n'
+      '      "risk_level": "high",\n'
+      '      "reasoning": "Brief explanation"\n'
+      '    }\n'
+      '  ],\n'
+      '  "summary": "2-3 sentence overall assessment of exam integrity"\n'
+      '}\n\n'
+      'risk_level: "high" (>0.85 or direct copy), "medium" (0.65-0.85), "low" (notable coincidence).\n'
+      'Only flag genuinely suspicious pairs. Empty flagged_pairs if no plagiarism found.\n\n'
+      'Data:\n${jsonEncode(analysisData)}';
+
+  final text = await _callClaude(prompt, system, maxTokens: 1024);
+  if (text == null) return {'success': false, 'error': 'AI service unavailable'};
+
+  try {
+    final match = RegExp(r'\{[\s\S]*\}').firstMatch(text);
+    if (match == null) return {'success': false, 'error': 'No JSON in AI response'};
+    final result = jsonDecode(match.group(0)!) as Map<String, dynamic>;
+    return {'success': true, ...result};
+  } catch (_) {
+    return {'success': false, 'error': 'Failed to parse AI response'};
   }
 }
 

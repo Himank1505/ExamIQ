@@ -297,6 +297,44 @@ class ApiService {
     }
   }
 
+  // ── AI: student performance insights ─────────────────────────────────────
+  static Future<Map<String, dynamic>> getStudentInsights({
+    required Map<String, dynamic> performanceData,
+  }) async {
+    try {
+      final res = await _postWithFallback(
+        '/api/student-insights',
+        performanceData,
+        timeout: const Duration(seconds: 45),
+      );
+      return jsonDecode(res.body) as Map<String, dynamic>;
+    } catch (e) {
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  // ── AI: detect plagiarism across student answers ──────────────────────────
+  static Future<Map<String, dynamic>> detectPlagiarism({
+    required String examId,
+    required List<Map<String, dynamic>> questions,
+    required List<Map<String, dynamic>> studentAnswers,
+  }) async {
+    try {
+      final res = await _postWithFallback(
+        '/api/detect-plagiarism',
+        {
+          'exam_id': examId,
+          'questions': questions,
+          'student_answers': studentAnswers,
+        },
+        timeout: const Duration(seconds: 60),
+      );
+      return jsonDecode(res.body) as Map<String, dynamic>;
+    } catch (e) {
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
   // ── Send report email to teacher ───────────────────────────────────────────
   static Future<Map<String, dynamic>> sendReportEmail({
     required String examId,

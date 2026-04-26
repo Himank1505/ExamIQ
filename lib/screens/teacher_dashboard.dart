@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -29,6 +30,11 @@ class _TeacherDashboardState extends State<TeacherDashboard>
   List<Map<String, dynamic>> _completedExams = [];
   bool _isLoading = true;
 
+  // Live alert feed
+  final List<Map<String, dynamic>> _alerts = [];
+  int _unreadAlerts = 0;
+  StreamSubscription<QuerySnapshot>? _alertSub;
+
   DateTime? _parseDate(dynamic value) {
     if (value == null) return null;
     if (value is Timestamp) return value.toDate();
@@ -48,7 +54,214 @@ class _TeacherDashboardState extends State<TeacherDashboard>
   @override
   void dispose() {
     _tabController.dispose();
+    _alertSub?.cancel();
     super.dispose();
+  }
+
+  void _startAlertStream() {
+    _alertSub?.cancel();
+    final ids = _liveExams.map((e) => e['id'] as String).take(10).toList();
+    if (ids.isEmpty) return;
+
+    _alertSub = _db
+        .collection('exam_events')
+        .where('exam_id', whereIn: ids)
+        .where('flag_level', whereIn: ['hard', 'critical'])
+        .snapshots()
+        .listen((snap) {
+      for (final change in snap.docChanges) {
+        if (change.type != DocumentChangeType.added) continue;
+        final data = Map<String, dynamic>.from(change.doc.data()!);
+        if (!mounted) return;
+        setState(() {
+          _alerts.insert(0, data);
+          if (_alerts.length > 100) _alerts.removeLast();
+          _unreadAlerts++;
+        });
+        _showAlertBanner(data);
+      }
+    });
+  }
+
+  void _showAlertBanner(Map<String, dynamic> event) {
+    if (!mounted) return;
+    final score     = event['fraud_score'] ?? 0;
+    final level     = event['flag_level'] ?? 'hard';
+    final studentId = event['student_id'] ?? '';
+    final isCrit    = level == 'critical';
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        backgroundColor: isCrit ? const Color(0xFFA32D2D) : const Color(0xFFBA7517),
+        duration: const Duration(seconds: 5),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        content: Row(
+          children: [
+            Icon(isCrit ? Icons.error_rounded : Icons.warning_rounded,
+                color: Colors.white, size: 18),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                '${isCrit ? 'CRITICAL' : 'HIGH'} — Student $studentId · Score $score',
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+              ),
+            ),
+          ],
+        ),
+        action: SnackBarAction(
+          label: 'View',
+          textColor: Colors.white,
+          onPressed: _showAlertFeed,
+        ),
+      ),
+    );
+  }
+
+  void _showAlertFeed() {
+    setState(() => _unreadAlerts = 0);
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.6,
+        minChildSize: 0.4,
+        maxChildSize: 0.92,
+        expand: false,
+        builder: (_, sc) => _buildAlertSheet(sc),
+      ),
+    );
+  }
+
+  Widget _buildAlertSheet(ScrollController sc) {
+    return Column(
+      children: [
+        Container(
+          margin: const EdgeInsets.only(top: 10),
+          width: 40, height: 4,
+          decoration: BoxDecoration(
+            color: Colors.grey[300],
+            borderRadius: BorderRadius.circular(2),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+          child: Row(
+            children: [
+              const Icon(Icons.notifications_active_rounded,
+                  color: Color(0xFFA32D2D), size: 20),
+              const SizedBox(width: 8),
+              const Text('Live Alerts',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              const Spacer(),
+              if (_alerts.isNotEmpty)
+                TextButton(
+                  onPressed: () => setState(() => _alerts.clear()),
+                  child: const Text('Clear all',
+                      style: TextStyle(fontSize: 12, color: Colors.grey)),
+                ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: _alerts.isEmpty
+              ? const Center(
+                  child: Text('No alerts yet.',
+                      style: TextStyle(color: Colors.grey, fontSize: 14)),
+                )
+              : ListView.separated(
+                  controller: sc,
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  itemCount: _alerts.length,
+                  separatorBuilder: (_, __) =>
+                      const Divider(height: 1, indent: 16, endIndent: 16),
+                  itemBuilder: (_, i) => _alertTile(_alerts[i]),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _alertTile(Map<String, dynamic> event) {
+    final level     = event['flag_level'] ?? 'hard';
+    final score     = event['fraud_score'] ?? 0;
+    final studentId = event['student_id'] ?? '';
+    final examId    = event['exam_id'] ?? '';
+    final ts        = DateTime.tryParse(event['timestamp'] ?? '');
+    final isCrit    = level == 'critical';
+
+    final timeLabel = ts != null
+        ? '${ts.hour.toString().padLeft(2, '0')}:${ts.minute.toString().padLeft(2, '0')}'
+        : '';
+
+    String reason = 'Suspicious activity';
+    if (event['face_absent'] == true)         reason = 'Face absent from camera';
+    else if (event['multiple_faces'] == true) reason = 'Multiple faces detected';
+    else if (event['deepfake'] == true)       reason = 'Possible deepfake/spoof';
+    else if ((event['tab_switch_count'] ?? 0) > 2) reason = 'Repeated tab switching';
+
+    return ListTile(
+      leading: CircleAvatar(
+        radius: 18,
+        backgroundColor: isCrit ? const Color(0xFFFCEBEB) : const Color(0xFFFAEEDA),
+        child: Icon(
+          isCrit ? Icons.error_rounded : Icons.warning_amber_rounded,
+          color: isCrit ? const Color(0xFFA32D2D) : const Color(0xFFBA7517),
+          size: 18,
+        ),
+      ),
+      title: Text(
+        studentId,
+        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+      ),
+      subtitle: Text(
+        '$reason · Score $score',
+        style: TextStyle(
+          fontSize: 12,
+          color: isCrit ? const Color(0xFFA32D2D) : const Color(0xFFBA7517),
+        ),
+      ),
+      trailing: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          Text(timeLabel,
+              style: const TextStyle(fontSize: 11, color: Colors.grey)),
+          const SizedBox(height: 4),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+            decoration: BoxDecoration(
+              color: isCrit ? const Color(0xFFA32D2D) : const Color(0xFFBA7517),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              level.toUpperCase(),
+              style: const TextStyle(color: Colors.white, fontSize: 10,
+                  fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+      onTap: () {
+        Navigator.pop(context);
+        final exam = _liveExams.firstWhere(
+          (e) => e['id'] == examId,
+          orElse: () => {'id': examId, 'title': examId},
+        );
+        Navigator.push(context, MaterialPageRoute(
+          builder: (_) => ReportScreen(
+            examId: examId,
+            examTitle: exam['title'] ?? examId,
+            isLive: true,
+          ),
+        ));
+      },
+    );
   }
 
   Future<void> _loadData() async {
@@ -114,6 +327,7 @@ class _TeacherDashboardState extends State<TeacherDashboard>
       debugPrint('Error loading teacher data: $e');
     }
     if (mounted) setState(() => _isLoading = false);
+    _startAlertStream();
   }
 
   Future<void> _logout() async {
@@ -180,6 +394,367 @@ class _TeacherDashboardState extends State<TeacherDashboard>
     );
   }
 
+  // ── Plagiarism detection ────────────────────────────────────────────────────
+  Future<void> _checkPlagiarism(Map<String, dynamic> exam) async {
+    final examId = exam['id'] as String;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(
+          children: [
+            CircularProgressIndicator(color: Color(0xFF534AB7)),
+            SizedBox(width: 16),
+            Expanded(child: Text('Analyzing answers for plagiarism...')),
+          ],
+        ),
+      ),
+    );
+
+    try {
+      // Fetch exam questions
+      final examDoc = await _db.collection('exams').doc(examId).get();
+      final questionsRaw = (examDoc.data()?['questions'] as List? ?? [])
+          .cast<Map<String, dynamic>>();
+
+      // Fetch all student answer docs for this exam
+      final answerDocs = await _db
+          .collection('exam_answers')
+          .where('exam_id', isEqualTo: examId)
+          .get();
+
+      final studentAnswers = answerDocs.docs.map((doc) {
+        final d = doc.data();
+        return {
+          'student_id': d['student_id'] ?? doc.id,
+          'answers': d['answers'] ?? {},
+        };
+      }).toList();
+
+      if (!mounted) return;
+      Navigator.pop(context); // close loading dialog
+
+      if (studentAnswers.length < 2) {
+        _showError('Need at least 2 student submissions to check for plagiarism.');
+        return;
+      }
+
+      final result = await ApiService.detectPlagiarism(
+        examId: examId,
+        questions: questionsRaw,
+        studentAnswers: studentAnswers,
+      );
+
+      if (!mounted) return;
+
+      if (result['success'] != true) {
+        _showError(result['error'] ?? 'Plagiarism check failed');
+        return;
+      }
+
+      final flagged = List<Map<String, dynamic>>.from(
+        (result['flagged_pairs'] as List? ?? [])
+            .map((e) => Map<String, dynamic>.from(e as Map)),
+      );
+      final summary = result['summary'] as String? ?? '';
+      _showPlagiarismSheet(exam['title'] ?? '', flagged, summary);
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.pop(context);
+      _showError('Error: $e');
+    }
+  }
+
+  void _showPlagiarismSheet(
+    String examTitle,
+    List<Map<String, dynamic>> flagged,
+    String summary,
+  ) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.75,
+        minChildSize: 0.5,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (_, sc) => _buildPlagiarismSheet(sc, examTitle, flagged, summary),
+      ),
+    );
+  }
+
+  Widget _buildPlagiarismSheet(
+    ScrollController sc,
+    String examTitle,
+    List<Map<String, dynamic>> flagged,
+    String summary,
+  ) {
+    return Column(
+      children: [
+        Container(
+          margin: const EdgeInsets.only(top: 10),
+          width: 40,
+          height: 4,
+          decoration: BoxDecoration(
+            color: Colors.grey[300],
+            borderRadius: BorderRadius.circular(2),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+          child: Row(
+            children: [
+              const Icon(Icons.content_copy_rounded,
+                  color: Color(0xFF534AB7), size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Plagiarism Report · $examTitle',
+                  style: const TextStyle(
+                      fontSize: 15, fontWeight: FontWeight.bold),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: ListView(
+            controller: sc,
+            padding: const EdgeInsets.all(16),
+            children: [
+              // Summary card
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: flagged.isEmpty
+                      ? const Color(0xFFE1F5EE)
+                      : const Color(0xFFFCF3DC),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      flagged.isEmpty
+                          ? Icons.verified_rounded
+                          : Icons.warning_amber_rounded,
+                      color: flagged.isEmpty
+                          ? const Color(0xFF1D9E75)
+                          : const Color(0xFFBA7517),
+                      size: 20,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            flagged.isEmpty
+                                ? 'No Plagiarism Detected'
+                                : '${flagged.length} Suspicious Pair${flagged.length > 1 ? 's' : ''} Found',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                              color: flagged.isEmpty
+                                  ? const Color(0xFF085041)
+                                  : const Color(0xFFBA7517),
+                            ),
+                          ),
+                          if (summary.isNotEmpty) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              summary,
+                              style: const TextStyle(
+                                  fontSize: 12, color: Colors.black87),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (flagged.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.only(top: 40),
+                  child: Center(
+                    child: Text(
+                      'All text answers appear original.',
+                      style: TextStyle(color: Colors.grey, fontSize: 14),
+                    ),
+                  ),
+                )
+              else ...[
+                const SizedBox(height: 16),
+                ...flagged.map((pair) => _plagiarismPairCard(pair)),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _plagiarismPairCard(Map<String, dynamic> pair) {
+    final riskLevel = pair['risk_level'] as String? ?? 'medium';
+    final score = ((pair['similarity_score'] as num?)?.toDouble() ?? 0.0);
+    final pct = (score * 100).toStringAsFixed(0);
+    final studentA = pair['student_a'] as String? ?? '';
+    final studentB = pair['student_b'] as String? ?? '';
+    final question = pair['question'] as String? ?? '';
+    final answerA = pair['answer_a'] as String? ?? '';
+    final answerB = pair['answer_b'] as String? ?? '';
+    final reasoning = pair['reasoning'] as String? ?? '';
+
+    final Color riskColor;
+    final Color riskBg;
+    switch (riskLevel) {
+      case 'high':
+        riskColor = const Color(0xFFA32D2D);
+        riskBg = const Color(0xFFFCEBEB);
+      case 'low':
+        riskColor = const Color(0xFF085041);
+        riskBg = const Color(0xFFE1F5EE);
+      default:
+        riskColor = const Color(0xFFBA7517);
+        riskBg = const Color(0xFFFAEEDA);
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: riskColor.withOpacity(0.3)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.04),
+            blurRadius: 6,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: riskBg,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    riskLevel.toUpperCase(),
+                    style: TextStyle(
+                      color: riskColor,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '$pct% similarity',
+                  style: TextStyle(
+                    color: riskColor,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 13,
+                  ),
+                ),
+                const Spacer(),
+                const Icon(Icons.people_alt_rounded,
+                    size: 14, color: Colors.grey),
+                const SizedBox(width: 4),
+                Text(
+                  '$studentA & $studentB',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Q: $question',
+              style: const TextStyle(
+                  fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xFF1a1a2e)),
+            ),
+            const SizedBox(height: 8),
+            _answerCompareRow(studentA, answerA),
+            const SizedBox(height: 4),
+            _answerCompareRow(studentB, answerB),
+            if (reasoning.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF5F4FF),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.auto_awesome,
+                        size: 13, color: Color(0xFF534AB7)),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        reasoning,
+                        style: const TextStyle(
+                            fontSize: 11, color: Color(0xFF534AB7)),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _answerCompareRow(String studentId, String answer) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          decoration: BoxDecoration(
+            color: const Color(0xFFEEEDFE),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Text(
+            studentId,
+            style: const TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFF534AB7)),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            answer,
+            style: const TextStyle(fontSize: 12, color: Colors.black87),
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -188,6 +763,42 @@ class _TeacherDashboardState extends State<TeacherDashboard>
         title: const Text('ExamIQ'),
         automaticallyImplyLeading: false,
         actions: [
+          // Live alert bell
+          Stack(
+            alignment: Alignment.center,
+            children: [
+              IconButton(
+                icon: const Icon(Icons.notifications_rounded),
+                tooltip: 'Live Alerts',
+                onPressed: _showAlertFeed,
+              ),
+              if (_unreadAlerts > 0)
+                Positioned(
+                  top: 8,
+                  right: 8,
+                  child: GestureDetector(
+                    onTap: _showAlertFeed,
+                    child: Container(
+                      padding: const EdgeInsets.all(3),
+                      decoration: const BoxDecoration(
+                        color: Color(0xFFA32D2D),
+                        shape: BoxShape.circle,
+                      ),
+                      constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+                      child: Text(
+                        _unreadAlerts > 99 ? '99+' : '$_unreadAlerts',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 9,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: _loadData,
@@ -727,6 +1338,23 @@ class _TeacherDashboardState extends State<TeacherDashboard>
                   ),
                 ),
               ],
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => _checkPlagiarism(exam),
+                icon: const Icon(Icons.content_copy_rounded, size: 16),
+                label: const Text('Check Plagiarism'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFBA7517),
+                  side: const BorderSide(color: Color(0xFFBA7517)),
+                  minimumSize: const Size(0, 38),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
             ),
           ],
         ),

@@ -112,33 +112,8 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _startWebGuard();
-    _loadVerifyPolicy();
     _initCamera().then((_) => _verifyEntry());
     _loadExam();
-  }
-
-  Future<void> _loadVerifyPolicy() async {
-    try {
-      final doc = await _db.collection('system_config').doc('identity_verification').get();
-      if (!doc.exists || !mounted) return;
-      final data = doc.data() ?? {};
-      setState(() {
-        final attempts = ((data['attempts'] ?? _verifyAttempts) as num).toInt();
-        final minPositive =
-            ((data['min_positive_attempts'] ?? _verifyMinPositiveAttempts) as num).toInt();
-        _verifyAttempts = attempts.clamp(1, 8).toInt();
-        _verifyMinPositiveAttempts = minPositive.clamp(1, 8).toInt();
-        _verifyMinScore = ((data['min_score'] ?? _verifyMinScore) as num).toDouble();
-        if (data.containsKey('require_explicit_decision')) {
-          _requireExplicitVerifyDecision = _truthy(data['require_explicit_decision']);
-        }
-        if (data.containsKey('allow_server_fallback')) {
-          _allowServerFallbackWhenDown = _truthy(data['allow_server_fallback']);
-        }
-      });
-    } catch (e) {
-      debugPrint('Verify policy load failed: $e');
-    }
   }
 
   @override
@@ -1503,13 +1478,22 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
                               const Icon(Icons.videocam_off_rounded,
                                   color: Colors.white54, size: 48),
                               const SizedBox(height: 12),
-                              Text(
-                                'Camera unavailable:\n$_cameraError',
-                                style: const TextStyle(
-                                    color: Colors.white70, fontSize: 13),
+                              const Text(
+                                'Camera blocked by another app',
+                                style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.bold),
                                 textAlign: TextAlign.center,
                               ),
-                              const SizedBox(height: 16),
+                              const SizedBox(height: 8),
+                              const Text(
+                                'Close any app using your camera\n(Teams, Zoom, Skype, Windows Camera)\nthen tap Retry.',
+                                style: TextStyle(
+                                    color: Colors.white70, fontSize: 13, height: 1.5),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 20),
                               ElevatedButton.icon(
                                 onPressed: () async {
                                   await _recoverCamera();
@@ -1517,45 +1501,6 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
                                 },
                                 icon: const Icon(Icons.refresh),
                                 label: const Text('Retry Camera'),
-                              ),
-                              const SizedBox(height: 10),
-                              OutlinedButton.icon(
-                                onPressed: () async {
-                                  final frame = await _captureWithImagePicker();
-                                  if (frame == null || !mounted) return;
-                                  setState(() {
-                                    _verifyingEntry = true;
-                                    _verifyMessage = 'Verifying your identity...';
-                                  });
-                                  // run a single-shot verify with the picked photo
-                                  final result = await ApiService.verifyStudent(
-                                    studentId: widget.studentId,
-                                    examId: widget.examId,
-                                    faceImageBase64: frame,
-                                  );
-                                  if (!mounted) return;
-                                  final score = _extractVerifyScore(result);
-                                  if (_isVerifyCleared(result, score)) {
-                                    setState(() {
-                                      _entryVerified  = true;
-                                      _verifyingEntry = false;
-                                      _verifyMessage  = 'Identity verified. Exam starting...';
-                                    });
-                                    await Future.delayed(const Duration(seconds: 1));
-                                    _startExamTimer();
-                                    _startMonitoring();
-                                  } else {
-                                    setState(() {
-                                      _verifyingEntry = false;
-                                      _verifyMessage  = 'Verification failed (score: ${score.toStringAsFixed(2)}). Try again.';
-                                    });
-                                  }
-                                },
-                                icon: const Icon(Icons.camera_alt_outlined, color: Colors.white70),
-                                label: const Text('Take photo instead', style: TextStyle(color: Colors.white70)),
-                                style: OutlinedButton.styleFrom(
-                                  side: const BorderSide(color: Colors.white38),
-                                ),
                               ),
                             ],
                           ),
