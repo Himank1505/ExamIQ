@@ -347,21 +347,20 @@ class _TeacherDashboardState extends State<TeacherDashboard>
           children: [
             CircularProgressIndicator(color: Color(0xFF534AB7)),
             SizedBox(width: 16),
-            Text('Generating report...'),
+            Expanded(child: Text('Grading answers & building report...')),
           ],
         ),
       ),
     );
 
-    final result = await ApiService.generateReport(examId: examId);
-    if (!mounted) return;
-    Navigator.pop(context); // close dialog
-
-    if (result['success'] == true) {
-      // Grade submitted answers with AI
+    try {
+      // Grade all submitted answers → writes to exam_scores
       await GradingService.gradeExam(examId);
 
-      // Send email
+      // Build report documents from exam_events + exam_scores → writes to reports
+      await _saveReportToFirestore(examId);
+
+      // Send email notification
       final teacherEmail = _teacherData?['email'] ?? '';
       if (teacherEmail.isNotEmpty) {
         await ApiService.sendReportEmail(
@@ -370,7 +369,9 @@ class _TeacherDashboardState extends State<TeacherDashboard>
         );
       }
 
-      // Navigate to report screen
+      if (!mounted) return;
+      Navigator.pop(context);
+
       Navigator.push(
         context,
         MaterialPageRoute(
@@ -380,9 +381,171 @@ class _TeacherDashboardState extends State<TeacherDashboard>
           ),
         ),
       );
-    } else {
-      _showError(result['error'] ?? 'Failed to generate report');
+
+      // Refresh dashboard so "Report Ready" badge appears
+      _loadData();
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.pop(context);
+      _showError('Failed to generate report: $e');
     }
+  }
+
+  Future<void> _saveReportToFirestore(String examId) async {
+    // Fetch all monitoring events grouped by student
+    final eventsSnap = await _db
+        .collection('exam_events')
+        .where('exam_id', isEqualTo: examId)
+        .get();
+
+    final byStudent = <String, List<Map<String, dynamic>>>{};
+    for (final doc in eventsSnap.docs) {
+      final data      = doc.data();
+      final studentId = '${data['student_id'] ?? ''}'.trim();
+      if (studentId.isEmpty) continue;
+      byStudent.putIfAbsent(studentId, () => []).add(data);
+    }
+
+    // Fetch all graded scores
+    final scoresSnap = await _db
+        .collection('exam_scores')
+        .where('exam_id', isEqualTo: examId)
+        .get();
+
+    // Union of all student IDs
+    final allStudents = <String>{
+      ...byStudent.keys,
+      ...scoresSnap.docs.map((d) => '${d.data()['student_id'] ?? ''}'),
+    }..remove('');
+
+    int cleanCount    = 0;
+    int flaggedCount  = 0;
+    int criticalCount = 0;
+    double totalFraud = 0;
+
+    final batch = _db.batch();
+
+    for (final studentId in allStudents) {
+      final events = byStudent[studentId] ?? [];
+      events.sort((a, b) =>
+          (a['timestamp'] ?? '').compareTo(b['timestamp'] ?? ''));
+
+      // Max fraud score across all monitoring checks
+      final fraudScores = events
+          .map((e) => ((e['fraud_score'] ?? 0) as num).toInt())
+          .toList();
+      final maxFraud = fraudScores.isNotEmpty
+          ? fraudScores.reduce((a, b) => a > b ? a : b)
+          : 0;
+      totalFraud += maxFraud;
+
+      final flagCount = events
+          .where((e) =>
+              ['soft', 'hard', 'critical'].contains(e['flag_level']))
+          .length;
+
+      // Approximate SHAP-style breakdown from event data
+      double faceMismatch    = 0;
+      double behavioralDrift = 0;
+      double deepfakeScore   = 0;
+      for (final e in events) {
+        final fm = ((e['face_match_score'] as num?) ?? 1.0).toDouble();
+        faceMismatch    += (1.0 - fm).clamp(0.0, 1.0) * 10;
+        final bd = ((e['behavioral_drift'] as num?) ?? 0.0).toDouble();
+        behavioralDrift += bd * 10;
+        if (e['deepfake'] == true) deepfakeScore += 15;
+      }
+      if (events.isNotEmpty) {
+        faceMismatch    = (faceMismatch    / events.length).clamp(0, 40);
+        behavioralDrift = (behavioralDrift / events.length).clamp(0, 40);
+      }
+      deepfakeScore = deepfakeScore.clamp(0, 40);
+
+      // Tab-switch contribution
+      final tabSwitches = events
+          .where((e) =>
+              e['event_type'] == 'tab_switched' ||
+              e['event_type'] == 'app_backgrounded')
+          .length;
+      if (tabSwitches > 0) {
+        behavioralDrift = (behavioralDrift + tabSwitches * 5).clamp(0, 40);
+      }
+
+      final String recommendation;
+      if (maxFraud > 75) {
+        criticalCount++;
+        recommendation = 'escalate';
+      } else if (maxFraud > 55) {
+        flaggedCount++;
+        recommendation = 'investigate';
+      } else if (maxFraud > 30) {
+        flaggedCount++;
+        recommendation = 'monitor';
+      } else {
+        cleanCount++;
+        recommendation = 'clear';
+      }
+
+      final studentName = events.isNotEmpty
+          ? (events.first['student_name'] as String? ?? studentId)
+          : studentId;
+
+      batch.set(
+        _db.collection('reports').doc('student_${examId}_$studentId'),
+        {
+          'exam_id':           examId,
+          'student_id':        studentId,
+          'student_name':      studentName,
+          'report_type':       'per_student',
+          'final_fraud_score': maxFraud,
+          'flag_count':        flagCount,
+          'recommendation':    recommendation,
+          'shap_values': {
+            'face_mismatch':    faceMismatch,
+            'behavioral_drift': behavioralDrift,
+            'deepfake':         deepfakeScore,
+          },
+          'event_timeline':    events,
+          'generated_at':      DateTime.now().toIso8601String(),
+        },
+      );
+    }
+
+    final avgFraud = allStudents.isNotEmpty
+        ? totalFraud / allStudents.length
+        : 0.0;
+
+    // Class-wide summary doc
+    batch.set(
+      _db.collection('reports').doc('class_$examId'),
+      {
+        'exam_id':        examId,
+        'total_students': allStudents.length,
+        'clean_count':    cleanCount,
+        'flagged_count':  flaggedCount,
+        'critical_count': criticalCount,
+        'avg_fraud_score': avgFraud,
+        'generated_at':   DateTime.now().toIso8601String(),
+      },
+    );
+
+    // Flagged summary doc
+    batch.set(
+      _db.collection('reports').doc('flagged_$examId'),
+      {
+        'exam_id':       examId,
+        'flagged_count': flaggedCount + criticalCount,
+        'generated_at':  DateTime.now().toIso8601String(),
+      },
+    );
+
+    // Mark exam as report generated so "View Report" button enables
+    batch.update(
+      _db.collection('exams').doc(examId),
+      {'report_generated': true},
+    );
+
+    await batch.commit();
   }
 
   void _showError(String message) {
