@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:image_picker/image_picker.dart';
@@ -347,13 +348,29 @@ class _TeacherDashboardState extends State<TeacherDashboard>
           children: [
             CircularProgressIndicator(color: Color(0xFF534AB7)),
             SizedBox(width: 16),
-            Expanded(child: Text('Grading answers & building report...')),
+            Expanded(child: Text('Checking submissions...')),
           ],
         ),
       ),
     );
 
     try {
+      // Check how many students actually submitted answers
+      final answersSnap = await _db
+          .collection('exam_answers')
+          .where('exam_id', isEqualTo: examId)
+          .get();
+
+      if (!mounted) return;
+
+      if (answersSnap.docs.isEmpty) {
+        Navigator.pop(context);
+        _showNoSubmissionsDialog(exam['title'] ?? 'this exam');
+        return;
+      }
+
+      debugPrint('[Report] ${answersSnap.docs.length} submission(s) found for $examId');
+
       // Grade all submitted answers → writes to exam_scores
       await GradingService.gradeExam(examId);
 
@@ -382,13 +399,52 @@ class _TeacherDashboardState extends State<TeacherDashboard>
         ),
       );
 
-      // Refresh dashboard so "Report Ready" badge appears
       _loadData();
     } catch (e) {
       if (!mounted) return;
       Navigator.pop(context);
       _showError('Failed to generate report: $e');
     }
+  }
+
+  void _showNoSubmissionsDialog(String examTitle) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.inbox_outlined, color: Color(0xFFBA7517)),
+            SizedBox(width: 8),
+            Text('No Submissions Yet'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'No students have submitted "$examTitle" yet.',
+              style: const TextStyle(fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Students must:\n'
+              '1. Be enrolled (face registration complete)\n'
+              '2. Open the exam from their dashboard\n'
+              '3. Pass face verification\n'
+              '4. Complete and submit the exam',
+              style: TextStyle(fontSize: 13, color: Colors.black87, height: 1.6),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _saveReportToFirestore(String examId) async {
@@ -412,10 +468,17 @@ class _TeacherDashboardState extends State<TeacherDashboard>
         .where('exam_id', isEqualTo: examId)
         .get();
 
-    // Union of all student IDs
+    // Fetch all answer submissions (students who submitted even with no events)
+    final answersSnap = await _db
+        .collection('exam_answers')
+        .where('exam_id', isEqualTo: examId)
+        .get();
+
+    // Union of all student IDs across all three sources
     final allStudents = <String>{
       ...byStudent.keys,
       ...scoresSnap.docs.map((d) => '${d.data()['student_id'] ?? ''}'),
+      ...answersSnap.docs.map((d) => '${d.data()['student_id'] ?? ''}'),
     }..remove('');
 
     int cleanCount    = 0;
@@ -423,76 +486,96 @@ class _TeacherDashboardState extends State<TeacherDashboard>
     int criticalCount = 0;
     double totalFraud = 0;
 
-    final batch = _db.batch();
+    // Build a name map: prefer student_name stored in exam_answers, then look
+    // up the students collection, finally fall back to the raw UID.
+    final nameMap = <String, String>{};
+    for (final d in answersSnap.docs) {
+      final sid  = '${d.data()['student_id'] ?? ''}'.trim();
+      final name = '${d.data()['student_name'] ?? ''}'.trim();
+      if (sid.isNotEmpty && name.isNotEmpty) nameMap[sid] = name;
+    }
+    // Look up any still-missing names from the students collection
+    for (final sid in allStudents) {
+      if (nameMap.containsKey(sid)) continue;
+      try {
+        final doc = await _db.collection('students').doc(sid).get();
+        final name = (doc.data()?['name'] as String?)?.trim() ?? '';
+        if (name.isNotEmpty) nameMap[sid] = name;
+      } catch (_) {}
+    }
 
+    // Write each student report individually so one failure can't block others
     for (final studentId in allStudents) {
-      final events = byStudent[studentId] ?? [];
-      events.sort((a, b) =>
-          (a['timestamp'] ?? '').compareTo(b['timestamp'] ?? ''));
+      try {
+        final events = byStudent[studentId] ?? [];
+        events.sort((a, b) =>
+            (a['timestamp'] ?? '').compareTo(b['timestamp'] ?? ''));
 
-      // Max fraud score across all monitoring checks
-      final fraudScores = events
-          .map((e) => ((e['fraud_score'] ?? 0) as num).toInt())
-          .toList();
-      final maxFraud = fraudScores.isNotEmpty
-          ? fraudScores.reduce((a, b) => a > b ? a : b)
-          : 0;
-      totalFraud += maxFraud;
+        // Cap timeline at 50 events to stay well under Firestore's 1MB doc limit
+        final timeline = events.length > 50
+            ? events.sublist(events.length - 50)
+            : events;
 
-      final flagCount = events
-          .where((e) =>
-              ['soft', 'hard', 'critical'].contains(e['flag_level']))
-          .length;
+        final fraudScores = events
+            .map((e) => ((e['fraud_score'] ?? 0) as num).toInt())
+            .toList();
+        final maxFraud = fraudScores.isNotEmpty
+            ? fraudScores.reduce((a, b) => a > b ? a : b)
+            : 0;
+        totalFraud += maxFraud;
 
-      // Approximate SHAP-style breakdown from event data
-      double faceMismatch    = 0;
-      double behavioralDrift = 0;
-      double deepfakeScore   = 0;
-      for (final e in events) {
-        final fm = ((e['face_match_score'] as num?) ?? 1.0).toDouble();
-        faceMismatch    += (1.0 - fm).clamp(0.0, 1.0) * 10;
-        final bd = ((e['behavioral_drift'] as num?) ?? 0.0).toDouble();
-        behavioralDrift += bd * 10;
-        if (e['deepfake'] == true) deepfakeScore += 15;
-      }
-      if (events.isNotEmpty) {
-        faceMismatch    = (faceMismatch    / events.length).clamp(0, 40);
-        behavioralDrift = (behavioralDrift / events.length).clamp(0, 40);
-      }
-      deepfakeScore = deepfakeScore.clamp(0, 40);
+        final flagCount = events
+            .where((e) =>
+                ['soft', 'hard', 'critical'].contains(e['flag_level']))
+            .length;
 
-      // Tab-switch contribution
-      final tabSwitches = events
-          .where((e) =>
-              e['event_type'] == 'tab_switched' ||
-              e['event_type'] == 'app_backgrounded')
-          .length;
-      if (tabSwitches > 0) {
-        behavioralDrift = (behavioralDrift + tabSwitches * 5).clamp(0, 40);
-      }
+        double faceMismatch    = 0;
+        double behavioralDrift = 0;
+        double deepfakeScore   = 0;
+        for (final e in events) {
+          final fm = ((e['face_match_score'] as num?) ?? 1.0).toDouble();
+          faceMismatch    += (1.0 - fm).clamp(0.0, 1.0) * 10;
+          final bd = ((e['behavioral_drift'] as num?) ?? 0.0).toDouble();
+          behavioralDrift += bd * 10;
+          if (e['deepfake'] == true) deepfakeScore += 15;
+        }
+        if (events.isNotEmpty) {
+          faceMismatch    = (faceMismatch    / events.length).clamp(0, 40);
+          behavioralDrift = (behavioralDrift / events.length).clamp(0, 40);
+        }
+        deepfakeScore = deepfakeScore.clamp(0, 40);
 
-      final String recommendation;
-      if (maxFraud > 75) {
-        criticalCount++;
-        recommendation = 'escalate';
-      } else if (maxFraud > 55) {
-        flaggedCount++;
-        recommendation = 'investigate';
-      } else if (maxFraud > 30) {
-        flaggedCount++;
-        recommendation = 'monitor';
-      } else {
-        cleanCount++;
-        recommendation = 'clear';
-      }
+        final tabSwitches = events
+            .where((e) =>
+                e['event_type'] == 'tab_switched' ||
+                e['event_type'] == 'app_backgrounded')
+            .length;
+        if (tabSwitches > 0) {
+          behavioralDrift =
+              (behavioralDrift + tabSwitches * 5).clamp(0, 40);
+        }
 
-      final studentName = events.isNotEmpty
-          ? (events.first['student_name'] as String? ?? studentId)
-          : studentId;
+        final String recommendation;
+        if (maxFraud > 75) {
+          criticalCount++;
+          recommendation = 'escalate';
+        } else if (maxFraud > 55) {
+          flaggedCount++;
+          recommendation = 'investigate';
+        } else if (maxFraud > 30) {
+          flaggedCount++;
+          recommendation = 'monitor';
+        } else {
+          cleanCount++;
+          recommendation = 'clear';
+        }
 
-      batch.set(
-        _db.collection('reports').doc('student_${examId}_$studentId'),
-        {
+        final studentName = nameMap[studentId] ?? studentId;
+
+        await _db
+            .collection('reports')
+            .doc('student_${examId}_$studentId')
+            .set({
           'exam_id':           examId,
           'student_id':        studentId,
           'student_name':      studentName,
@@ -505,31 +588,34 @@ class _TeacherDashboardState extends State<TeacherDashboard>
             'behavioral_drift': behavioralDrift,
             'deepfake':         deepfakeScore,
           },
-          'event_timeline':    events,
+          'event_timeline':    timeline,
           'generated_at':      DateTime.now().toIso8601String(),
-        },
-      );
+        });
+
+        debugPrint('[Report] Wrote report for student $studentId');
+      } catch (e) {
+        debugPrint('[Report] Failed to write report for $studentId: $e');
+      }
     }
 
     final avgFraud = allStudents.isNotEmpty
         ? totalFraud / allStudents.length
         : 0.0;
 
-    // Class-wide summary doc
+    // Class-wide summary and exam flag — use a small batch for atomicity
+    final batch = _db.batch();
     batch.set(
       _db.collection('reports').doc('class_$examId'),
       {
-        'exam_id':        examId,
-        'total_students': allStudents.length,
-        'clean_count':    cleanCount,
-        'flagged_count':  flaggedCount,
-        'critical_count': criticalCount,
+        'exam_id':         examId,
+        'total_students':  allStudents.length,
+        'clean_count':     cleanCount,
+        'flagged_count':   flaggedCount,
+        'critical_count':  criticalCount,
         'avg_fraud_score': avgFraud,
-        'generated_at':   DateTime.now().toIso8601String(),
+        'generated_at':    DateTime.now().toIso8601String(),
       },
     );
-
-    // Flagged summary doc
     batch.set(
       _db.collection('reports').doc('flagged_$examId'),
       {
@@ -538,14 +624,13 @@ class _TeacherDashboardState extends State<TeacherDashboard>
         'generated_at':  DateTime.now().toIso8601String(),
       },
     );
-
-    // Mark exam as report generated so "View Report" button enables
     batch.update(
       _db.collection('exams').doc(examId),
       {'report_generated': true},
     );
-
     await batch.commit();
+
+    debugPrint('[Report] Done. ${allStudents.length} students processed.');
   }
 
   void _showError(String message) {
@@ -591,7 +676,7 @@ class _TeacherDashboardState extends State<TeacherDashboard>
 
       if (scoresSnap.docs.isEmpty) {
         Navigator.pop(context);
-        _showError('No graded scores yet. Generate the report first.');
+        _showError('No graded scores found. Tap "Generate Report" first so student answers are graded.');
         return;
       }
 
@@ -1109,19 +1194,43 @@ class _TeacherDashboardState extends State<TeacherDashboard>
           .where('exam_id', isEqualTo: examId)
           .get();
 
+      // Build name map: stored student_name first, then students collection
+      final plagNameMap = <String, String>{};
+      for (final doc in answerDocs.docs) {
+        final d    = doc.data();
+        final sid  = '${d['student_id'] ?? ''}'.trim();
+        final name = '${d['student_name'] ?? ''}'.trim();
+        if (sid.isNotEmpty && name.isNotEmpty) plagNameMap[sid] = name;
+      }
+      for (final doc in answerDocs.docs) {
+        final sid = '${doc.data()['student_id'] ?? ''}'.trim();
+        if (sid.isEmpty || plagNameMap.containsKey(sid)) continue;
+        try {
+          final sDoc = await _db.collection('students').doc(sid).get();
+          final name = (sDoc.data()?['name'] as String?)?.trim() ?? '';
+          if (name.isNotEmpty) plagNameMap[sid] = name;
+        } catch (_) {}
+      }
+
       final studentAnswers = answerDocs.docs.map((doc) {
-        final d = doc.data();
+        final d   = doc.data();
+        final sid = '${d['student_id'] ?? doc.id}'.trim();
         return {
-          'student_id': d['student_id'] ?? doc.id,
-          'answers': d['answers'] ?? {},
+          'student_id':   sid,
+          'student_name': plagNameMap[sid] ?? sid,
+          'answers':      d['answers'] ?? {},
         };
       }).toList();
 
       if (!mounted) return;
       Navigator.pop(context); // close loading dialog
 
+      if (studentAnswers.isEmpty) {
+        _showError('No student submissions found. Students must submit the exam first.');
+        return;
+      }
       if (studentAnswers.length < 2) {
-        _showError('Need at least 2 student submissions to check for plagiarism.');
+        _showError('Need at least 2 student submissions to check for plagiarism. Only ${studentAnswers.length} submission found.');
         return;
       }
 
@@ -2077,6 +2186,9 @@ class _TeacherDashboardState extends State<TeacherDashboard>
     final picker = ImagePicker();
     bool isCreating = false;
     bool isGenerating = false;
+    String selectedDifficulty = 'medium';
+    int mcqCount  = 5;
+    int textCount = 2;
 
     final courses = [
       'B.Tech Computer Science',
@@ -2221,98 +2333,216 @@ class _TeacherDashboardState extends State<TeacherDashboard>
                           ],
                         ),
                         const SizedBox(height: 10),
-                        Row(
+                        // Syllabus text area
+                        Stack(
                           children: [
-                            Expanded(
-                              child: TextField(
-                                controller: topicController,
-                                decoration: const InputDecoration(
-                                  labelText: 'Topic / Syllabus',
-                                  hintText: 'e.g. Binary Trees',
-                                  isDense: true,
-                                  contentPadding: EdgeInsets.symmetric(
-                                      horizontal: 12, vertical: 10),
+                            TextField(
+                              controller: topicController,
+                              maxLines: 6,
+                              minLines: 4,
+                              keyboardType: TextInputType.multiline,
+                              textInputAction: TextInputAction.newline,
+                              enableInteractiveSelection: true,
+                              decoration: const InputDecoration(
+                                labelText: 'Syllabus / Topics',
+                                hintText:
+                                    'Describe the topics here…\ne.g. Binary Trees, AVL Trees, Red-Black Trees, Heaps',
+                                isDense: true,
+                                alignLabelWithHint: true,
+                                contentPadding: EdgeInsets.fromLTRB(
+                                    12, 10, 48, 10),
+                              ),
+                            ),
+                            Positioned(
+                              top: 4,
+                              right: 4,
+                              child: Tooltip(
+                                message: 'Paste from clipboard',
+                                child: IconButton(
+                                  icon: const Icon(Icons.content_paste_rounded,
+                                      size: 18, color: Color(0xFF534AB7)),
+                                  onPressed: () async {
+                                    final data = await Clipboard.getData(
+                                        Clipboard.kTextPlain);
+                                    if (data?.text != null &&
+                                        data!.text!.isNotEmpty) {
+                                      topicController.text = data.text!;
+                                      topicController.selection =
+                                          TextSelection.collapsed(
+                                              offset:
+                                                  topicController.text.length);
+                                    }
+                                  },
                                 ),
                               ),
                             ),
-                            const SizedBox(width: 10),
-                            ElevatedButton(
-                              onPressed: isGenerating
-                                  ? null
-                                  : () async {
-                                      final topic = topicController.text.trim();
-                                      if (topic.isEmpty) {
-                                        showSheetError(
-                                            'Enter a topic to generate questions.');
-                                        return;
-                                      }
-                                      setSheetState(() => isGenerating = true);
-                                      try {
-                                        final generated =
-                                            await AiService.generateQuestions(
-                                          topic: topic,
-                                          mcqCount: 5,
-                                          textCount: 2,
-                                        );
-                                        for (final q in draftQuestions) {
-                                          q.dispose();
-                                        }
-                                        draftQuestions.clear();
-                                        for (final qData in generated) {
-                                          final dq = _DraftQuestion();
-                                          dq.type =
-                                              qData['type'] as String? ?? 'mcq';
-                                          dq.questionController.text =
-                                              qData['q'] as String? ?? '';
-                                          dq.marksController.text =
-                                              '${qData['marks'] ?? 1}';
-                                          if (dq.type == 'mcq') {
-                                            final opts = List<String>.from(
-                                                qData['options'] as List? ?? []);
-                                            for (int i = 0;
-                                                i < opts.length && i < 4;
-                                                i++) {
-                                              dq.optionControllers[i].text =
-                                                  opts[i];
-                                            }
-                                            dq.correctOption =
-                                                qData['correct_option'] is int
-                                                    ? qData['correct_option']
-                                                        as int
-                                                    : null;
-                                          } else {
-                                            dq.modelAnswerController.text =
-                                                qData['model_answer']
-                                                        as String? ??
-                                                    '';
-                                          }
-                                          draftQuestions.add(dq);
-                                        }
-                                      } catch (e) {
-                                        showSheetError('Generation failed: $e');
-                                      }
-                                      setSheetState(() => isGenerating = false);
-                                    },
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFF534AB7),
-                                foregroundColor: Colors.white,
-                                minimumSize: const Size(0, 44),
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 16),
-                                shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(10)),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        // Question counts row
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _CountStepper(
+                                label: 'MCQ',
+                                value: mcqCount,
+                                onChanged: (v) =>
+                                    setSheetState(() => mcqCount = v),
                               ),
-                              child: isGenerating
-                                  ? const SizedBox(
-                                      width: 16,
-                                      height: 16,
-                                      child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                          color: Colors.white),
-                                    )
-                                  : const Text('Generate'),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: _CountStepper(
+                                label: 'Text',
+                                value: textCount,
+                                onChanged: (v) =>
+                                    setSheetState(() => textCount = v),
+                              ),
                             ),
                           ],
+                        ),
+                        const SizedBox(height: 10),
+                        // Difficulty selector
+                        Row(
+                          children: [
+                            const Text(
+                              'Difficulty:',
+                              style: TextStyle(
+                                  fontSize: 12,
+                                  color: Color(0xFF534AB7),
+                                  fontWeight: FontWeight.w500),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Row(
+                                children: [
+                                  for (final d in ['easy', 'medium', 'hard'])
+                                    Expanded(
+                                      child: GestureDetector(
+                                        onTap: () => setSheetState(
+                                            () => selectedDifficulty = d),
+                                        child: Container(
+                                          margin: EdgeInsets.only(
+                                              right: d == 'hard' ? 0 : 6),
+                                          padding: const EdgeInsets.symmetric(
+                                              vertical: 6),
+                                          decoration: BoxDecoration(
+                                            color: selectedDifficulty == d
+                                                ? const Color(0xFF534AB7)
+                                                : Colors.white,
+                                            borderRadius:
+                                                BorderRadius.circular(8),
+                                            border: Border.all(
+                                                color:
+                                                    const Color(0xFF534AB7)),
+                                          ),
+                                          child: Text(
+                                            d[0].toUpperCase() +
+                                                d.substring(1),
+                                            textAlign: TextAlign.center,
+                                            style: TextStyle(
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w600,
+                                              color: selectedDifficulty == d
+                                                  ? Colors.white
+                                                  : const Color(0xFF534AB7),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        // Generate button
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton.icon(
+                            icon: isGenerating
+                                ? const SizedBox(
+                                    width: 14,
+                                    height: 14,
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white),
+                                  )
+                                : const Icon(Icons.auto_awesome_rounded,
+                                    size: 16),
+                            label: Text(isGenerating
+                                ? 'Generating…'
+                                : 'Generate Questions'),
+                            onPressed: isGenerating
+                                ? null
+                                : () async {
+                                    final topic =
+                                        topicController.text.trim();
+                                    if (topic.isEmpty) {
+                                      showSheetError(
+                                          'Paste a syllabus or describe topics first.');
+                                      return;
+                                    }
+                                    setSheetState(() => isGenerating = true);
+                                    try {
+                                      final generated =
+                                          await AiService.generateQuestions(
+                                        topic: topic,
+                                        mcqCount: mcqCount,
+                                        textCount: textCount,
+                                        difficulty: selectedDifficulty,
+                                      );
+                                      for (final q in draftQuestions) {
+                                        q.dispose();
+                                      }
+                                      draftQuestions.clear();
+                                      for (final qData in generated) {
+                                        final dq = _DraftQuestion();
+                                        dq.type =
+                                            qData['type'] as String? ??
+                                                'mcq';
+                                        dq.questionController.text =
+                                            qData['q'] as String? ?? '';
+                                        dq.marksController.text =
+                                            '${qData['marks'] ?? 1}';
+                                        if (dq.type == 'mcq') {
+                                          final opts = List<String>.from(
+                                              qData['options'] as List? ??
+                                                  []);
+                                          for (int i = 0;
+                                              i < opts.length && i < 4;
+                                              i++) {
+                                            dq.optionControllers[i].text =
+                                                opts[i];
+                                          }
+                                          dq.correctOption =
+                                              qData['correct_option'] is int
+                                                  ? qData['correct_option']
+                                                      as int
+                                                  : null;
+                                        } else {
+                                          dq.modelAnswerController.text =
+                                              qData['model_answer']
+                                                      as String? ??
+                                                  '';
+                                        }
+                                        draftQuestions.add(dq);
+                                      }
+                                    } catch (e) {
+                                      showSheetError(
+                                          'Generation failed: $e');
+                                    }
+                                    setSheetState(() => isGenerating = false);
+                                  },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF534AB7),
+                              foregroundColor: Colors.white,
+                              minimumSize: const Size(0, 44),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10)),
+                            ),
+                          ),
                         ),
                       ],
                     ),
@@ -2752,5 +2982,87 @@ class _DraftQuestion {
     for (final c in optionControllers) {
       c.dispose();
     }
+  }
+}
+
+class _CountStepper extends StatelessWidget {
+  const _CountStepper({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String label;
+  final int value;
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFF534AB7).withOpacity(0.4)),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            '$label count',
+            style: const TextStyle(
+                fontSize: 12,
+                color: Color(0xFF534AB7),
+                fontWeight: FontWeight.w500),
+          ),
+          Row(
+            children: [
+              GestureDetector(
+                onTap: value > 0
+                    ? () => onChanged(value - 1)
+                    : null,
+                child: Container(
+                  width: 24,
+                  height: 24,
+                  decoration: BoxDecoration(
+                    color: value > 0
+                        ? const Color(0xFF534AB7)
+                        : Colors.grey.shade300,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: const Icon(Icons.remove,
+                      size: 14, color: Colors.white),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                child: Text(
+                  '$value',
+                  style: const TextStyle(
+                      fontSize: 14, fontWeight: FontWeight.w700),
+                ),
+              ),
+              GestureDetector(
+                onTap: value < 20
+                    ? () => onChanged(value + 1)
+                    : null,
+                child: Container(
+                  width: 24,
+                  height: 24,
+                  decoration: BoxDecoration(
+                    color: value < 20
+                        ? const Color(0xFF534AB7)
+                        : Colors.grey.shade300,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: const Icon(Icons.add,
+                      size: 14, color: Colors.white),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
   }
 }

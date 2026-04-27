@@ -590,9 +590,11 @@ class _StudentDashboardState extends State<StudentDashboard> {
                     context,
                     MaterialPageRoute(
                       builder: (_) => ExamScreen(
-                        examId:    exam['id'],
-                        studentId: _studentData?['id'] ?? '',
-                        examTitle: title,
+                        examId:      exam['id'],
+                        studentId:   _studentData?['id'] ??
+                            FirebaseAuth.instance.currentUser?.uid ?? '',
+                        studentName: _studentData?['name'] ?? '',
+                        examTitle:   title,
                       ),
                     ),
                   )

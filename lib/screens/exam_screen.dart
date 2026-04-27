@@ -20,12 +20,14 @@ import 'report_screen.dart';
 class ExamScreen extends StatefulWidget {
   final String examId;
   final String studentId;
+  final String studentName;
   final String examTitle;
 
   const ExamScreen({
     super.key,
     required this.examId,
     required this.studentId,
+    required this.studentName,
     required this.examTitle,
   });
 
@@ -33,7 +35,8 @@ class ExamScreen extends StatefulWidget {
   State<ExamScreen> createState() => _ExamScreenState();
 }
 
-class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
+class _ExamScreenState extends State<ExamScreen>
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   final _db = FirebaseFirestore.instance;
 
   // ── Camera ─────────────────────────────────────────────────────────────────
@@ -46,6 +49,11 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
   Map<int, dynamic> _answers = {}; // questionIndex → answer (int for mcq, String for text)
   final Map<int, TextEditingController> _textAnswerControllers = {};
   final FocusNode _webAnswerFocusNode = FocusNode(debugLabel: 'web_answer_focus');
+  late final AnimationController _cursorBlink = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 530),
+  )..repeat(reverse: true);
+  bool _webBoxFocused = false;
   int  _currentQuestion      = 0;
   bool _examLoading          = true;
   bool _examSubmitted        = false;
@@ -114,6 +122,9 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
     _startWebGuard();
     _initCamera().then((_) => _verifyEntry());
     _loadExam();
+    _webAnswerFocusNode.addListener(() {
+      setState(() => _webBoxFocused = _webAnswerFocusNode.hasFocus);
+    });
   }
 
   @override
@@ -126,6 +137,7 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
     _audioRecorder.dispose();
     _webExamGuard.stop();
     _webGuardActive = false;
+    _cursorBlink.dispose();
     _webAnswerFocusNode.dispose();
     _cameraController?.dispose();
     for (final c in _textAnswerControllers.values) {
@@ -628,20 +640,19 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
 
   void _setTextAnswer(int index, String value, {String? previous}) {
     final prev = (previous ?? (_answers[index] ?? '')).toString();
-    final trimmed = value.trim();
     _textEditEvents++;
     final delta = value.length - prev.length;
     _recordAction(
-      changedAnswer: trimmed != prev.trim(),
+      changedAnswer: value.trim() != prev.trim(),
       charsDelta: delta,
       isBackspace: delta < 0,
       isPasteLike: delta >= 6,
     );
     setState(() {
-      if (trimmed.isEmpty) {
+      if (value.trim().isEmpty) {
         _answers.remove(index);
       } else {
-        _answers[index] = trimmed;
+        _answers[index] = value;
       }
     });
   }
@@ -698,15 +709,42 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
           decoration: BoxDecoration(
             color: Colors.white,
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: const Color(0xFFBDBDBD)),
-          ),
-          child: Text(
-            current.isEmpty ? 'Type your answer (paste disabled)...' : current,
-            style: TextStyle(
-              color: current.isEmpty ? Colors.grey : const Color(0xFF1a1a2e),
-              fontSize: 14,
+            border: Border.all(
+              color: _webBoxFocused
+                  ? const Color(0xFF534AB7)
+                  : const Color(0xFFBDBDBD),
+              width: _webBoxFocused ? 2 : 1,
             ),
           ),
+          child: current.isEmpty && !_webBoxFocused
+              ? const Text(
+                  'Tap here and type your answer (paste disabled)...',
+                  style: TextStyle(color: Colors.grey, fontSize: 14),
+                )
+              : AnimatedBuilder(
+                  animation: _cursorBlink,
+                  builder: (_, __) {
+                    final showCursor =
+                        _webBoxFocused && _cursorBlink.value > 0.5;
+                    return RichText(
+                      text: TextSpan(
+                        style: const TextStyle(
+                            color: Color(0xFF1a1a2e), fontSize: 14, height: 1.5),
+                        children: [
+                          TextSpan(text: current),
+                          if (showCursor)
+                            const TextSpan(
+                              text: '|',
+                              style: TextStyle(
+                                color: Color(0xFF534AB7),
+                                fontWeight: FontWeight.w300,
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
         ),
       ),
     );
@@ -1208,6 +1246,7 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
         .set({
       'exam_id':      widget.examId,
       'student_id':   widget.studentId,
+      'student_name': widget.studentName,
       'answers':      _answers.map((k, v) => MapEntry('$k', v)),
       'submitted_at': DateTime.now().toIso8601String(),
       'graded':       false,

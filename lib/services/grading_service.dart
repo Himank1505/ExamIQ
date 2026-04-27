@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
 import 'api_service.dart';
 
 class GradingService {
@@ -6,21 +7,28 @@ class GradingService {
 
   static Future<void> gradeExam(String examId) async {
     final examDoc = await _db.collection('exams').doc(examId).get();
-    if (!examDoc.exists) return;
+    if (!examDoc.exists) {
+      debugPrint('[GradingService] Exam doc $examId not found');
+      return;
+    }
 
     final questions = List<Map<String, dynamic>>.from(
       ((examDoc.data()!['questions'] as List?) ?? [])
           .map((q) => Map<String, dynamic>.from(q as Map)),
     );
+    debugPrint('[GradingService] Exam has ${questions.length} questions');
 
     final answersSnap = await _db
         .collection('exam_answers')
         .where('exam_id', isEqualTo: examId)
         .get();
 
+    debugPrint('[GradingService] Found ${answersSnap.docs.length} answer submissions');
+
     for (final ansDoc in answersSnap.docs) {
       final ansData  = ansDoc.data();
       final studentId = ansData['student_id'] as String? ?? '';
+      debugPrint('[GradingService] Grading student: $studentId');
       final rawAnswers = Map<String, dynamic>.from(ansData['answers'] as Map? ?? {});
 
       final questionScores = <Map<String, dynamic>>[];
